@@ -7,7 +7,10 @@ from collections import deque, namedtuple
 
 import numpy as np
 import torch as T
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Dict, Any
 import gym
 
 from agent import Agent
@@ -35,7 +38,7 @@ parser.add_argument(
 parser.add_argument(
     '--batch_size',
     type=int,
-    default=64,
+    default=32,
     help='Mini-batch size for learning'
 )
 parser.add_argument(
@@ -61,7 +64,7 @@ args = parser.parse_args()
 # --------------------
 # 2) Flask 앱 및 글로벌 버퍼 설정
 # --------------------
-app = Flask(__name__)
+app = FastAPI()
 
 GLOBAL_BUFFER_SIZE = args.buffer_size
 BATCH_SIZE         = args.batch_size
@@ -70,19 +73,32 @@ UPDATE_INTERVAL    = args.update_interval
 
 
 buffer_lock   = threading.Lock()
+weights_lock = threading.Lock()
 global_memory = deque(maxlen=GLOBAL_BUFFER_SIZE) # 로컬 to 글로벌 저장 메모리
 Transition    = namedtuple('Transition',
                            ['state','action','reward','next_state','done'])
 
 #  로컬에서 업로드된 파라미터 저장소
 LOCAL_WEIGHTS = {}  # client_id → state_dict
+WEIGHT_EXPIRY_SEC = 1000      # seconds before weight expires
 
-# Aggregation 설정
-AGG_EPISODE_INTERVAL       = 300
-TD_IMPROVEMENT_THRESHOLD   = 0.05
-episode_count              = 0
-last_mean_td               = None
+# Aggregation 인터벌 (초)
+AGG_INTERVAL_SEC = 200.0 
+last_agg_time    = time.time()
 
+# JSON 요청을 위한 Pydantic 모델 (클라이언트 입력용)
+class TransitionRequest(BaseModel):
+    state: List[float]
+    action: int
+    reward: float
+    next_state: List[float]
+    done: bool
+    
+# 가중치 업로드를 위한 Pydantic 모델
+class WeightsRequest(BaseModel):
+    client_id: str
+    state_dict: Dict[str, Any]
+    
 # --------------------
 # 3) 글로벌 에이전트 초기화
 # --------------------
@@ -103,143 +119,308 @@ global_agent.Q_next = global_agent.Q_eval
 # --------------------
 # 4) 로컬 전이 수신 엔드포인트
 # --------------------
-@app.route('/upload-transition', methods=['POST'])
-def upload_transition():
-    data = request.get_json()  # List[dict]
-    with buffer_lock:
-        for t in data:
-            global_memory.append(Transition(
-                np.array(t['state'],      dtype=np.float32),
-                int(t['action']),
-                float(t['reward']),
-                np.array(t['next_state'], dtype=np.float32),
-                bool(t['done'])
-            ))
-    return jsonify({'status': 'ok', 'size': len(global_memory)}), 200
+@app.post("/upload-transition")
+async def upload_transition(transitions: List[TransitionRequest]):
+    try:
+        # 버퍼 락 획득
+        if not buffer_lock.acquire(timeout=10):  # 10초 타임아웃
+            return JSONResponse(
+                status_code=503, 
+                content={"status": "error", "message": "Server busy. Please try again later."}
+            )
+        
+        try:
+            # 전역 버퍼에 추가
+            global global_memory
+            
+            for t in transitions:
+                # JSON 데이터를 namedtuple로 변환
+                transition = Transition(
+                    state=t.state,
+                    action=t.action,
+                    reward=t.reward,
+                    next_state=t.next_state,
+                    done=t.done
+                )
+                global_memory.append(transition)
+            
+            # 버퍼가 가득 차면 가장 오래된 항목이 자동으로 제거
+            
+            print(f"Added {len(transitions)} transitions. Current buffer size: {len(global_memory)}")
+            
+            return {
+                "status": "success",
+                "added": len(transitions),
+                "current_buffer_size": len(global_memory),
+                "buffer_max_size": global_memory.maxlen
+            }
+        
+        finally:
+            # 락 해제
+            buffer_lock.release()
+    
+    except Exception as e:
+        # 예외 발생 시 락이 해제되지 않았다면 해제
+        if buffer_lock.locked():
+            buffer_lock.release()
+        
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# 버퍼 확인용 라우트 (락 X)
+@app.get("/view-buffer")
+def view_buffer():
+    try:
+        buffer_content = [
+            {
+                "state": t.state,
+                "action": t.action,
+                "reward": t.reward,
+                "next_state": t.next_state,
+                "done": t.done
+            } for t in global_memory
+        ]
+        
+        return {
+            "buffer_size": len(global_memory),
+            "buffer_max_size": global_memory.maxlen,
+            "buffer_content": buffer_content
+        }
+    
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+@app.delete("/clear-buffer")
+def clear_buffer():
+    try:
+        # 버퍼 락 획득
+        if not buffer_lock.acquire(timeout=5):  # 5초 타임아웃
+            return JSONResponse(
+                status_code=503, 
+                content={"status": "error", "message": "Server busy. Please try again later."}
+            )
+        
+        try:
+            global global_buffer
+            buffer_size_before = len(global_buffer)
+            global_buffer.clear()  # deque 비우기
+            
+            return {
+                "status": "success",
+                "message": f"Successfully cleared buffer. Removed {buffer_size_before} items.",
+                "current_buffer_size": 0,
+                "buffer_max_size": global_buffer.maxlen
+            }
+        
+        finally:
+            # 락 해제
+            buffer_lock.release()
+    
+    except Exception as e:
+        # 예외 발생 시 락이 해제되지 않았다면 해제
+        if buffer_lock.locked():
+            buffer_lock.release()
+        
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 # 로컬 가중치 업로드 
-@app.route('/upload-weights', methods=['POST'])
-def upload_weights():
-    # 로컬 에이전트가 에피소드 AGG_EPISODE_INTERVAL마다 자신의 state_dict를 보냄
-    # JSON으로 받아 파이토치 텐서로 복원하여 LOCAL_WEIGHTS에 저장
-    payload   = request.get_json()
-    client_id = payload['client_id'] # 어떤 로컬
-    sd_json   = payload['state_dict'] # 파라미터터
-    # JSON 리스트 → tensor 변환하는 거거
-    state_dict = {k: T.tensor(v, dtype=T.float32)
-                  for k, v in sd_json.items()}
-    LOCAL_WEIGHTS[client_id] = state_dict
-    return jsonify({'status': 'ok'}), 200
+@app.post("/upload-weights")
+async def upload_weights(weights_data: WeightsRequest):
+    try:
+        # 가중치 락 획득
+        if not weights_lock.acquire(timeout=5):  # 5초 타임아웃
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "message": "Please try again later."}
+            )
+        
+        try:
+            global LOCAL_WEIGHTS
+            
+            client_id = weights_data.client_id
+            state_dict_json = weights_data.state_dict
+            
+            # JSON 형태의 state_dict를 텐서로 변환
+            state_dict = {}
+            for key, value in state_dict_json.items():
+                # 텐서로 변환해야 하는 경우
+                if isinstance(value, list) or isinstance(value, dict):
+                    state_dict[key] = T.tensor(value, dtype=T.float32)
+                else:
+                    state_dict[key] = value
+            
+            # LOCAL_WEIGHTS에 저장
+            LOCAL_WEIGHTS[client_id] = (state_dict, time.time())
+            print("state_dict ??????????????????????????",state_dict)
+            print(f"Received weights from client {client_id}. Total clients: {len(LOCAL_WEIGHTS)}")
+            print("→ incoming keys:", list(state_dict_json.keys()))
+            print("→ model keys   :", list(global_agent.Q_eval.state_dict().keys()))
+            
+            return {
+                "status": "success",
+                "message": f"Weights received from client {client_id}",
+                "total_clients": len(LOCAL_WEIGHTS)
+            }
+        
+        finally:
+            # 락 해제
+            weights_lock.release()
+    
+    except Exception as e:
+        # 예외 발생 시 락이 해제되지 않았다면 해제
+        if weights_lock.locked():
+            weights_lock.release()
+        
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
+@app.delete("/clear-weights")
+def clear_weights():
+    try:
+        # 가중치 락 획득
+        if not weights_lock.acquire(timeout=5):
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "message": "Server busy. Please try again later."}
+            )
+        
+        try:
+            global LOCAL_WEIGHTS
+            weights_count_before = len(LOCAL_WEIGHTS)
+            LOCAL_WEIGHTS.clear()
+            
+            return {
+                "status": "success",
+                "message": f"Successfully cleared weights from {weights_count_before} clients.",
+                "current_clients": 0
+            }
+        
+        finally:
+            # 락 해제
+            weights_lock.release()
+    
+    except Exception as e:
+        # 예외 발생 시 락이 해제되지 않았다면 해제
+        if weights_lock.locked():
+            weights_lock.release()
+        
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# 유효 파라미터 필터링 -> 너무 오랬동안 담겨져 있던 파라미터면 삭제 유효성을 위해서
+def get_valid_local_weights():
+    now = time.time()
+    valid = []
+    for client, (sd, ts) in list(LOCAL_WEIGHTS.items()):
+        if now - ts <= WEIGHT_EXPIRY_SEC:
+            valid.append(sd)
+        else:
+            del LOCAL_WEIGHTS[client]
+    return valid
 
 # Aggregation 함수
 def aggregate_parameters():
     # θ_new = 0.5·θ_global + 0.5/K · sum_i θ_local_i (현재 예시시 형태로 만들어 놓은 거임)
-    global global_agent
-    K = len(LOCAL_WEIGHTS)
+    local_sds = get_valid_local_weights()
+    K = len(local_sds)
+    print("k>???????????????????????????", K)
     if K == 0:
+        print("k = 0 return-----------------------")
         return
     alpha = 0.5
     beta  = 0.5 / K
-
-    g_state    = global_agent.Q_eval.state_dict()
-    new_state  = {}
-
+    g_state = global_agent.Q_eval.state_dict()
+    new_state = {}
     for key, g_param in g_state.items():
         combined = alpha * g_param.clone()
-        for sd in LOCAL_WEIGHTS.values():
+        for sd in local_sds:
             combined += beta * sd[key]
         new_state[key] = combined
-
+    print(new_state, "new state-================================")
     global_agent.Q_eval.load_state_dict(new_state)
     global_agent.Q_next.load_state_dict(new_state)
-    print(f"[AGG] Aggregated params with α={alpha}, β={beta:.4f}")
+    
+    print(f"[AGG] merged {K} locals (α={alpha}, β={beta:.4f})")
 
-#  글로벌 모델 학습 파라미터와 TD error 기반 트리거
-def env_runner():
-    global episode_count, last_mean_td
-
-    while True:
-        state = env.reset()
-        done  = False
-        td_list = []
-
-        while not done:
-            action = global_agent.choose_action(state)
-            next_s, r, done, _ = env.step(action)
-
-            # TD error 계산
-            s_v      = T.tensor(state, dtype=T.float32).unsqueeze(0).to(global_agent.Q_eval.device)
-            ns_v     = T.tensor(next_s, dtype=T.float32).unsqueeze(0).to(global_agent.Q_eval.device)
-            q_eval   = global_agent.Q_eval(s_v)[0, action].item()
-            q_next   = global_agent.Q_next(ns_v).detach().max(1)[0].item()
-            td_error = abs(r + global_agent.gamma * q_next * (1 - done) - q_eval)
-            td_list.append(td_error)
-
-            # 전이 저장
-            with buffer_lock:
-                global_memory.append(Transition(state, action, r, next_s, done))
-
-            state = next_s
-
-        episode_count += 1
-        global_agent.epsilon_decay()
-
-        # 주기 & TD 개선율 확인 확인해서 업데이트 할 지 말지 결정정
-        if episode_count % AGG_EPISODE_INTERVAL == 0:
-            mean_td = sum(td_list) / len(td_list)
-            if last_mean_td is None or (last_mean_td - mean_td) / last_mean_td > TD_IMPROVEMENT_THRESHOLD:
-                print(f"[AGG] Ep {episode_count}: TD {last_mean_td}→{mean_td:.4f}, aggregating")
-                aggregate_parameters()
-            else:
-                print(f"[AGG] Ep {episode_count}: TD improvement {(last_mean_td - mean_td):.4f} too small, skip")
-            last_mean_td = mean_td
-
-# --------------------
-# 8) 글로벌 배치 학습 루프
-# --------------------
+# 배치 학습 &  Aggregation
 def train_loop():
+    global last_agg_time
     device = T.device('cuda' if T.cuda.is_available() else 'cpu')
+    
+    print("train_loop start")
     while True:
+        # --- Replay Buffer로부터 배치 샘플링 & 학습 ---
         with buffer_lock:
+            print("train loop learning")
             if len(global_memory) >= BATCH_SIZE:
-                batch = random.sample(global_memory, k=BATCH_SIZE)
+                batch = random.sample(global_memory, BATCH_SIZE)
             else:
                 batch = None
-
+                
+        if batch is None: print("버퍼 부족, batch None")
+        
         if batch:
-            states      = T.tensor(
-                np.vstack([e.state      for e in batch]), device=device)
-            actions     = T.tensor(
-                np.vstack([e.action     for e in batch]), device=device).long()
-            rewards     = T.tensor(
-                np.vstack([e.reward     for e in batch]), device=device)
-            next_states = T.tensor(
-                np.vstack([e.next_state for e in batch]), device=device)
-            dones       = T.tensor(
-                np.vstack([e.done       for e in batch]).astype(np.uint8),
-                device=device
-            ).float()
+            states      = T.tensor(np.vstack([e.state      for e in batch]),
+                                dtype=T.float32, device=device)
+            actions     = T.tensor(np.vstack([e.action     for e in batch]),
+                                dtype=T.int64,   device=device)
+            rewards     = T.tensor(np.vstack([e.reward     for e in batch]),
+                                dtype=T.float32, device=device)
+            next_states = T.tensor(np.vstack([e.next_state for e in batch]),
+                                dtype=T.float32, device=device)
+            dones       = T.tensor(np.vstack([e.done       for e in batch]).astype(np.uint8),
+                                dtype=T.float32, device=device)
 
             global_agent.learn((states, actions, rewards, next_states, dones))
+
+        # --- 주기적 파라미터 Aggregation ---
+        now = time.time()
+        if now - last_agg_time >= AGG_INTERVAL_SEC:
+            print("parameter aggregation")
+            aggregate_parameters()
+            last_agg_time = now
 
         time.sleep(UPDATE_INTERVAL)
 
 
 # 9) Aggregated params 다운로드 엔드포인트
-@app.route('/download-params', methods=['GET'])
-def download_params():
-    sd = global_agent.Q_eval.state_dict()
-    sd_json = {k: v.cpu().numpy().tolist() for k, v in sd.items()}
-    return jsonify({'state_dict': sd_json}), 200
-
+# 9) 글로벌 모델 파라미터 다운로드 엔드포인트
+@app.get("/download-params")
+async def download_params():
+    try:
+        global global_agent
+        
+        # 글로벌 에이전트의 현재 상태 딕셔너리 가져오기
+        state_dict = global_agent.Q_eval.state_dict()
+        
+        # PyTorch 텐서를 JSON 직렬화 가능한 형식으로 변환
+        serializable_weights = {}
+        for key, tensor in state_dict.items():
+            if isinstance(tensor, T.Tensor):
+                serializable_weights[key] = tensor.cpu().tolist()  # 텐서를 CPU로 이동 후 리스트로 변환
+            else:
+                serializable_weights[key] = tensor
+        
+        # 간단하게 데이터 타입과 키 출력
+        print(f"다운로드 요청: 타입={type(serializable_weights)}, 키={list(serializable_weights.keys())}")
+        
+        return {
+            "status": "success",
+            "message": "글로벌 모델 파라미터를 성공적으로 가져왔습니다",
+            "weights": serializable_weights
+        }
+    
+    except Exception as e:
+        print(f"오류: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"파라미터 가져오기 오류: {str(e)}"}
+        )        
 # --------------------
 # 실행
 # --------------------
 if __name__ == '__main__':
-    threading.Thread(target=env_runner, daemon=True).start()
+    print("[MAIN] starting train_loop thread")
     threading.Thread(target=train_loop,  daemon=True).start()
-    app.run(host='0.0.0.0', port=args.port, threaded=True, debug=False)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5050)
 
 
 
